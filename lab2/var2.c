@@ -10,15 +10,52 @@
 #define TAU 0.001
 #define N 1580
 
-void multiplyMatrixVector(double* localA, double* localX, double* fullX, double* localRes, int localRowsFromN, int* recvcounts, int* displs, MPI_Comm comm) {
-    MPI_Allgatherv(localX, localRowsFromN, MPI_DOUBLE, fullX, recvcounts, displs, MPI_DOUBLE, comm);
-    for (int i = 0; i < localRowsFromN; i++) {
-        double sum = 0.0;
-        for (int j = 0; j < N; j++) {
-            sum += localA[i * N + j] * fullX[j];
-        }
-        localRes[i] = sum;        
+void multiplyMatrixVector(double* localA, double* localX, double* localRes, int localRowsFromN, int* recvcounts, int* displs, int size, int rank, MPI_Comm comm) {
+    int maxRows;
+    MPI_Allreduce(&localRowsFromN, &maxRows, 1, MPI_INT, MPI_MAX, comm);
+
+    if (maxRows <= 0) {
+        MPI_Abort(comm, 1);
     }
+
+    double* bufferX = (double*)calloc((size_t)maxRows, sizeof(double));
+    if (bufferX == NULL) {
+        MPI_Abort(comm, 1);
+    }
+    for (int i = 0; i < localRowsFromN; i++) {
+        bufferX[i] = localX[i];  //копируем в буфер
+    }
+
+    double* tempRes = (double*)calloc((size_t)localRowsFromN, sizeof(double));
+    if (tempRes == NULL) {
+        free(bufferX);
+        MPI_Abort(comm, 1);
+    }
+
+    for (int step = 0; step < size; step++) {
+        int senderRank = (rank - step + size) % size;
+        int senderDispls = displs[senderRank];
+        int senderRecvcounts = recvcounts[senderRank];
+
+        for (int i = 0; i < localRowsFromN; i++) {
+            for (int j = 0; j < senderRecvcounts; j++) {
+                tempRes[i] += localA[i * N + (senderDispls + j)] * bufferX[j];
+            }
+        }
+        
+        if (step < size - 1) {
+            int sendTo = (rank + 1) % size;
+            int recvFrom = (rank - 1 + size) % size;
+            MPI_Sendrecv_replace(bufferX, maxRows, MPI_DOUBLE, sendTo, 0, recvFrom, 0, comm, MPI_STATUS_IGNORE);
+        }
+    }
+
+    for (int i = 0; i < localRowsFromN; i++) {
+        localRes[i] = tempRes[i];
+    }
+
+    free(bufferX);
+    free(tempRes);
 }
 
 void subVectors(double* localAx, double* localB, double* localRes, int localRowsFromN) {
@@ -85,12 +122,9 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < size; i++){
         recvcounts[i] = numberOfRowsForProcess + (i < ostatok ? 1 : 0);
         displs[i] = numberOfRowsForProcess * i + (i < ostatok ? i : ostatok);
-    }
+    }    
 
-    double* fullX = (double*)malloc(N * sizeof(double)); 
-    double* fullU = (double*)malloc(N * sizeof(double));
-
-    multiplyMatrixVector(localA, localU, fullX, localB, localRowsFromN, recvcounts, displs, MPI_COMM_WORLD);
+    multiplyMatrixVector(localA, localU, localB, localRowsFromN, recvcounts, displs, size, rank, MPI_COMM_WORLD);
     
     double minTime = DBL_MAX;
 
@@ -103,7 +137,7 @@ int main(int argc, char* argv[]) {
         double bNorm = calculateNorm(localB, localRowsFromN);
 
         while (1) {
-            multiplyMatrixVector(localA, localX, fullX, localAx, localRowsFromN, recvcounts, displs, MPI_COMM_WORLD);
+            multiplyMatrixVector(localA, localX, localAx, localRowsFromN, recvcounts, displs, size, rank, MPI_COMM_WORLD);
             subVectors(localAx, localB, localTempVector, localRowsFromN);
 
             if (test(localTempVector, bNorm, localRowsFromN)) break;
@@ -128,6 +162,8 @@ int main(int argc, char* argv[]) {
         printf("Минимальное время выполнения: %lf секунд\n", minTime);
     }
 
+    double* fullX = (double*)malloc(N * sizeof(double)); 
+    double* fullU = (double*)malloc(N * sizeof(double));
     MPI_Allgatherv(localX, localRowsFromN, MPI_DOUBLE, fullX, recvcounts, displs, MPI_DOUBLE, MPI_COMM_WORLD);
     MPI_Allgatherv(localU, localRowsFromN, MPI_DOUBLE, fullU, recvcounts, displs, MPI_DOUBLE, MPI_COMM_WORLD);
 
