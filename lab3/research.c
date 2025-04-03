@@ -122,9 +122,6 @@ int main(int args, char* argv[]) {
         MPI_Barrier(comm2d);
     }
     MPI_Barrier(comm2d);
-
-    //printf("Process %d: координаты (%d, %d)\n", rank, coords[0], coords[1]);
-    //MPI_Barrier(MPI_COMM_WORLD);
             
     int localN1 = N1 / p1;
     int localN3 = N3 / p2;
