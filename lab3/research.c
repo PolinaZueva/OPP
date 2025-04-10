@@ -14,7 +14,6 @@ void print_matrix(double* matrix, int rows, int cols, char* name, int rank) {
         printf("\n");
     }
     printf("\n");
-    fflush(stdout);
 }
 
 void multiplyMatrix(double* localA, double* localB, double* localC, int localN1, int localN3) {
@@ -96,18 +95,18 @@ int main(int args, char* argv[]) {
         printf("DIMS: %d %d\n", p1, p2);
     }
 
-    dims[0] = p1;  //по x
-    dims[1] = p2;  //по y
+    dims[0] = p1;  //по x - строки
+    dims[1] = p2;  //по y - столбцы
     int reorder = 1;
-    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, reorder, &comm2d);    
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, reorder, &comm2d);  //создает 2D-решетку процессов - новый коммуникатор   
 
     MPI_Comm_rank(comm2d, &rank);
-    MPI_Cart_get(comm2d, 2, dims, periods, coords);
+    MPI_Cart_get(comm2d, 2, dims, periods, coords);  //возвращает координаты текущего процесса в решетке
 
-    int varyingCoords[2];
-    varyingCoords[0] = 0;  //игнорируем изменения
-    varyingCoords[1] = 1;  //сохраняем изменение в подгруппе
-    MPI_Cart_sub(comm2d, varyingCoords, &commRow);
+    int varyingCoords[2];  //1-меняем, 0-запрет
+    varyingCoords[0] = 0;  //фиксируем строку
+    varyingCoords[1] = 1;  //меняем столбцы
+    MPI_Cart_sub(comm2d, varyingCoords, &commRow);  
     varyingCoords[0] = 1;  
     varyingCoords[1] = 0;  
     MPI_Cart_sub(comm2d, varyingCoords, &commCol);
@@ -148,41 +147,25 @@ int main(int args, char* argv[]) {
     for (int run = 0; run < numRuns; run++) {
         double totalStart = MPI_Wtime();
 
-        MPI_Datatype horizontalA;
-        MPI_Type_contiguous(localN1 * N2, MPI_DOUBLE, &horizontalA);
-        MPI_Type_commit(&horizontalA);
+        MPI_Datatype horizontalBlockTypeA;
+        MPI_Type_contiguous(localN1 * N2, MPI_DOUBLE, &horizontalBlockTypeA);
+        MPI_Type_commit(&horizontalBlockTypeA);
         if (coords[1] == 0) {
-            MPI_Scatter(fullA, 1, horizontalA, localA, localN1 * N2, MPI_DOUBLE, 0, commCol);
+            MPI_Scatter(fullA, 1, horizontalBlockTypeA, localA, localN1 * N2, MPI_DOUBLE, 0, commCol);
         }
-
-        MPI_Datatype verticalB;
-        MPI_Type_vector(N2, localN3, N3, MPI_DOUBLE, &verticalB);
-        MPI_Type_commit(&verticalB);
-
-        MPI_Datatype verticalBContiguous;
-        MPI_Type_contiguous(N2 * localN3, MPI_DOUBLE, &verticalBContiguous);
-        MPI_Type_commit(&verticalBContiguous);    
-
-        if (coords[0] == 0 && coords[1] == 0) {  //главный процесс первой строки отправляет части fullB другим процессам первой строки
-            for (int i = 0; i < N2; i++) {
-                for (int j = 0; j < localN3; j++) {
-                    localB[i * localN3 + j] = fullB[i * N3 + j];
-                }
-            }
-
-            for (int sendRank = 1; sendRank < p2; sendRank++) {
-                MPI_Send(fullB + sendRank * localN3, 1, verticalB, sendRank, 0, commRow);
-            }        
-        } else if (coords[0] == 0 && coords[1] != 0) {  //принимаем свою часть fullB
-            MPI_Recv(localB, 1, verticalBContiguous, 0, 0, commRow, MPI_STATUS_IGNORE);
-        }
-
-        //print_matrix(localB, N2, localN3, "localB (before broadcast)", rank);
-
         MPI_Bcast(localA, localN1 * N2, MPI_DOUBLE, 0, commRow);
-        MPI_Bcast(localB, N2 * localN3, MPI_DOUBLE, 0, commCol);
 
-        //print_matrix(localB, N2, localN3, "localB (after broadcast)", rank);  
+        MPI_Datatype verticalBlockTypeB, resizedTypeB;
+        MPI_Type_vector(N2, localN3, N3, MPI_DOUBLE, &verticalBlockTypeB);
+        MPI_Type_create_resized(verticalBlockTypeB, 0, localN3 * sizeof(double), &resizedTypeB);
+        MPI_Type_commit(&verticalBlockTypeB);
+        MPI_Type_commit(&resizedTypeB);
+        if (coords[0] == 0) {
+            MPI_Scatter(fullB, 1, resizedTypeB, localB, N2 * localN3, MPI_DOUBLE, 0, commRow);
+            //print_matrix(localB, N2, localN3, "localB (after scatter)", rank);
+        }   
+        MPI_Bcast(localB, N2 * localN3, MPI_DOUBLE, 0, commCol);         
+        //print_matrix(localB, N2, localN3, "localB (after broadcast)", rank);   
 
         double multiplyStart = MPI_Wtime();
         multiplyMatrix(localA, localB, localC, localN1, localN3);
@@ -196,37 +179,27 @@ int main(int args, char* argv[]) {
 
         MPI_Datatype submatrixType;
         MPI_Type_vector(localN1, localN3, N3, MPI_DOUBLE, &submatrixType);
+        MPI_Type_create_resized(submatrixType, 0, localN3 * sizeof(double), &submatrixType);
         MPI_Type_commit(&submatrixType);    
         
-        if (rank == 0) {  //собираем данные на 0 процессе
-            for (int i = 0; i < localN1; i++) {
-                for (int j = 0; j < localN3; j++) {
-                    fullC[i * N3 + j] = localC[i * localN3 + j];
-                }
+        int *recvcounts = (int*)malloc(size * sizeof(int));
+        int *displs = (int*)malloc(size * sizeof(int));
+        if (rank == 0) {
+            for (int procRank = 0; procRank < size; procRank++) {
+                recvcounts[procRank] = 1;  //от каждого процесса принимается ровно 1 блок типа submatrixType
+                int procCoords[2];
+                MPI_Cart_coords(comm2d, procRank, 2, procCoords);
+                displs[procRank] = procCoords[0] * localN1 * dims[1] + procCoords[1];
             }
-
-            double* temp = (double*)malloc(localN1 * localN3 * sizeof(double));
-            for (int senderRank = 1; senderRank < size; senderRank++) {
-                MPI_Recv(temp, localN1 * localN3, MPI_DOUBLE, senderRank, 0, comm2d, MPI_STATUS_IGNORE);
-                int senderRankCoords[2];
-                MPI_Cart_coords(comm2d, senderRank, 2, senderRankCoords);
-                int displsI = senderRankCoords[0] * localN1;
-                int displsJ = senderRankCoords[1] * localN3;
-
-                for (int i = 0; i < localN1; i++) {
-                    for (int j = 0; j < localN3; j++) {
-                        fullC[(displsI + i) * N3 + (displsJ + j)] = temp[i * localN3 + j];
-                    }
-                }
-            }
-            free(temp);
+            MPI_Gatherv(localC, localN1 * localN3, MPI_DOUBLE, fullC, recvcounts, displs, submatrixType, 0, comm2d); 
         } else {
-            MPI_Send(localC, localN1 * localN3, MPI_DOUBLE, 0, 0, comm2d);
-        }
-        MPI_Type_free(&submatrixType);
-        MPI_Type_free(&horizontalA);
-        MPI_Type_free(&verticalB);
-        MPI_Type_free(&verticalBContiguous);
+            MPI_Gatherv(localC, localN1 * localN3, MPI_DOUBLE, NULL, recvcounts, displs, submatrixType, 0, comm2d);
+        }     
+        
+        MPI_Type_free(&horizontalBlockTypeA);
+        MPI_Type_free(&verticalBlockTypeB);
+        MPI_Type_free(&resizedTypeB);
+        MPI_Type_free(&submatrixType); 
 
         double totalEnd = MPI_Wtime();
         double multiplyTime = multiplyEnd - multiplyStart;
