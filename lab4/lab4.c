@@ -129,10 +129,12 @@ int main(int args, char* argv[]) {
 
     double* phi = (double*)malloc(sizeof(double) * localNx * Ny * Nz);
     double* prevPhi = (double*)malloc(sizeof(double) * localNx * Ny * Nz);
-    double* sendLeft = (double*)malloc(sizeof(double) * Ny * Nz);
     double* recvLeft = (double*)malloc(sizeof(double) * Ny * Nz);
-    double* sendRight = (double*)malloc(sizeof(double) * Ny * Nz);
     double* recvRight = (double*)malloc(sizeof(double) * Ny * Nz);
+
+    MPI_Datatype myType;
+    MPI_Type_vector(Ny, Nz, Nz, MPI_DOUBLE, &myType);
+    MPI_Type_commit(&myType);
 
     double minTime = DBL_MAX;
     int numRuns = 1;
@@ -160,37 +162,25 @@ int main(int args, char* argv[]) {
         MPI_Request requests[4];  //т.к. четыре асинхронные операции может выполнять процесс
         double timeStart = MPI_Wtime();
 
-        do {  //пока максимальная разница между последовательными итерациями не станет меньше epsilon
+        do {  //пока максимальная разница между итерациями не станет меньше epsilon
             double maxDiff = 0.0;
             double* tmp = prevPhi;
             prevPhi = phi;
             phi = tmp;
 
-            int reqCount = 0;  //для отслеживания числа операций
-            if (rank != 0) {
-                for (int y = 0; y < Ny; ++y) {
-                    for (int z = 0; z < Nz; ++z) {
-                        sendLeft[Nz * y + z] = prevPhi[Ny * Nz * 1 + Nz * y + z];
-                    }
-                }
-                MPI_Isend(sendLeft, Ny * Nz, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, &requests[reqCount++]);  //передаем граничные данные соседним процессам
+            int reqCount = 0;  //для отслеживания числа операций    
+            if (rank != 0) {                
+                MPI_Isend(&prevPhi[Ny * Nz * 1], 1, myType, rank - 1, 0, MPI_COMM_WORLD, &requests[reqCount++]);  //передаем граничные данные соседним процессам
                 MPI_Irecv(recvLeft, Ny * Nz, MPI_DOUBLE, rank - 1, 1, MPI_COMM_WORLD, &requests[reqCount++]);  //принимаем
-            }
+            }            
             if (rank != size - 1) {
-                for (int y = 0; y < Ny; ++y) {
-                    for (int z = 0; z < Nz; ++z) {
-                        sendRight[Nz * y + z] = prevPhi[Ny * Nz * (localNx - 2) + Nz * y + z];
-                    }
-                }
-                MPI_Isend(sendRight, Ny * Nz, MPI_DOUBLE, rank + 1, 1, MPI_COMM_WORLD, &requests[reqCount++]);
+                MPI_Isend(&prevPhi[Ny * Nz * (localNx - 2)], 1, myType, rank + 1, 1, MPI_COMM_WORLD, &requests[reqCount++]);
                 MPI_Irecv(recvRight, Ny * Nz, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, &requests[reqCount++]);
             }         
 
             calculatePhiInside(prevPhi, phi, localNx, globalIndexStart, &maxDiff, recvLeft, recvRight, rank, size);  //обновляем phi^(k+1) во внутренних точках
             
-            for (int r = 0; r < reqCount; ++r) {  //блокируем процесс, пока все асинхронные операции не завершатся
-                MPI_Wait(&requests[r], MPI_STATUS_IGNORE);  
-            }
+            MPI_Waitall(reqCount, requests, MPI_STATUSES_IGNORE);
 
             calculatePhiOutside(prevPhi, phi, localNx, globalIndexStart, &maxDiff, recvLeft, recvRight, rank, size);  //обновляем phi^(k+1) на границах
 
@@ -218,11 +208,9 @@ int main(int args, char* argv[]) {
 
     free(phi);
     free(prevPhi);
-    free(sendLeft);
     free(recvLeft);
-    free(sendRight);
     free(recvRight);
-
+    MPI_Type_free(&myType);
     MPI_Finalize();
     return 0;
 }
